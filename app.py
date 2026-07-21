@@ -2,6 +2,7 @@ import math
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+import pandas as pd
 
 from JIT_core import SimulationSession, _default_test_inputs, JITState
 
@@ -10,6 +11,9 @@ st.set_page_config(page_title="JIT Simulation", layout="wide")
 
 
 DEFAULTS = _default_test_inputs()
+
+# Performance: maximum number of points to keep for live charts
+MAX_HISTORY_POINTS = 200
 
 
 def _collect_inputs_from_session_state() -> dict:
@@ -42,6 +46,9 @@ st.sidebar.slider("Road friction (μ)", 0.2, 0.8, float(DEFAULTS["road_friction"
 st.sidebar.checkbox("Rain detected", value=DEFAULTS["rain_detected"], key="rain_detected")
 st.sidebar.slider("Camera confidence", 0.0, 1.0, float(DEFAULTS["camera_confidence"]), step=0.01, key="camera_confidence")
 st.sidebar.checkbox("Driver override", value=DEFAULTS["driver_override"], key="driver_override")
+st.sidebar.markdown("---")
+# allow user to tune refresh for responsiveness
+st.sidebar.slider("Refresh interval (ms)", 50, 1000, 200, step=50, key="refresh_interval")
 
 
 # --- Control buttons ---
@@ -82,7 +89,8 @@ if reset_pressed:
 
 # --- Live stepping (autorefresh only when live) ---
 if st.session_state.ui_mode == "live":
-    st_autorefresh(interval=200, key="autorefresh")
+    refresh_ms = int(st.session_state.get("refresh_interval", 200))
+    st_autorefresh(interval=refresh_ms, key="autorefresh")
     sess = st.session_state.get("session")
     if sess is not None:
         inputs = _collect_inputs_from_session_state()
@@ -146,6 +154,51 @@ with col4:
 
 
 st.markdown("---")
+
+# --- Live traces and history ---
+if snapshot is not None:
+    # build safe arrays (session snapshot may provide either scalar ttc_min or list ttc_mins)
+    times = list(snapshot.get("times", []))
+    distances = list(snapshot.get("distances", []))
+    ttc_actuals = list(snapshot.get("ttc_actuals", []))
+    ttc_mins = list(snapshot.get("ttc_mins", [])) if snapshot.get("ttc_mins") is not None else [snapshot.get("ttc_min", math.inf)] * len(times)
+    brakes = list(snapshot.get("brake_engagement", []))
+
+    # Performance: limit history size to avoid large DataFrames and slow rendering
+    if len(times) > MAX_HISTORY_POINTS:
+        start = max(0, len(times) - MAX_HISTORY_POINTS)
+        times = times[start:]
+        distances = distances[start:]
+        ttc_actuals = ttc_actuals[start:]
+        ttc_mins = ttc_mins[start:]
+        brakes = brakes[start:]
+
+        if len(times) > 0:
+            st.subheader("Live traces")
+            # TTC chart (actual vs minimum)
+            ttc_df = pd.DataFrame({"TTC Actual": ttc_actuals, "TTC Minimum": ttc_mins}, index=times)
+            st.line_chart(ttc_df, height=260, use_container_width=True)
+
+        col_d, col_b = st.columns([2, 1])
+        with col_d:
+            dist_df = pd.DataFrame({"Distance (m)": distances}, index=times)
+            st.line_chart(dist_df, height=220, use_container_width=True)
+        with col_b:
+            brake_df = pd.DataFrame({"Brake Level": brakes}, index=times)
+            st.line_chart(brake_df, height=220, use_container_width=True)
+
+        # Recent state history
+        st.subheader("Recent states")
+        states = [s.value if hasattr(s, "value") else str(s) for s in snapshot.get("states", [])]
+        recent_n = 10
+        recent_rows = []
+        for i, t in enumerate(times[-recent_n:]):
+            idx = len(times) - recent_n + i
+            if idx < 0:
+                idx = i
+            state_label = states[idx] if idx < len(states) else "-"
+            recent_rows.append({"time (s)": f"{t:.2f}", "state": state_label})
+        st.table(recent_rows)
 
 if st.session_state.ui_mode == "idle":
     st.info("Simulation is IDLE. Press RUN to start.")
