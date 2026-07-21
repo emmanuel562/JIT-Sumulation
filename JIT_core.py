@@ -15,6 +15,7 @@ DEGRADED_CAMERA_THRESHOLD = 0.2
 DEGRADED_CAMERA_SECONDS = 3.0
 SUPPRESSED_TO_IDLE_SECONDS = 1.0
 BRAKE_MAX = 0.3
+BRAKE_DECELERATION = 5.0
 GRAVITY = 9.8
 DEFAULT_STEPS = 100
 DEFAULT_DT = 0.1
@@ -130,13 +131,16 @@ class JITStateMachine:
         ):
             self._transition(JITState.DEGRADED_CAMERA, dt)
         elif self.state == JITState.IDLE:
-            if ttc_actual <= ttc_min:
+            if ttc_actual <= ttc_min * 2:
                 self._transition(JITState.THREAT_CANDIDATE, dt)
             else:
                 self.time_in_state += dt
         elif self.state == JITState.THREAT_CANDIDATE:
             if camera_confidence >= CAMERA_CONFIDENCE_THRESHOLD:
-                self._transition(JITState.ACTUATING, dt)
+                if ttc_actual <= ttc_min:
+                    self._transition(JITState.ACTUATING, dt)
+                else:
+                    self.time_in_state += dt
             else:
                 self._transition(JITState.SUPPRESSED, dt)
         elif self.state == JITState.SUPPRESSED:
@@ -225,9 +229,6 @@ def simulate_run(
         noisy_distance = max(noisy_distance, 0.0)
         distance, _ = tracker.update(noisy_distance)
 
-        if closing_speed > 0:
-            true_distance = max(true_distance - closing_speed * dt, 0.0)
-
         ttc_actual = calculate_ttc_actual(distance, closing_speed)
         distances[i] = distance
         ttc_actuals[i] = ttc_actual
@@ -246,6 +247,10 @@ def simulate_run(
             brake_level = min(brake_level + ramp_rate * dt, BRAKE_MAX)
         else:
             brake_level = max(brake_level - ramp_rate * dt, 0.0)
+
+        closing_speed = max(closing_speed - brake_level * BRAKE_DECELERATION * dt, 0.0)
+        if closing_speed > 0:
+            true_distance = max(true_distance - closing_speed * dt, 0.0)
 
         brake_engagement[i] = brake_level
 
@@ -375,6 +380,10 @@ class SimulationSession:
             self.brake_level = min(self.brake_level + self.ramp_rate * dt, BRAKE_MAX)
         else:
             self.brake_level = max(self.brake_level - self.ramp_rate * dt, 0.0)
+
+        self.closing_speed = max(self.closing_speed - self.brake_level * BRAKE_DECELERATION * dt, 0.0)
+        if self.closing_speed > 0:
+            self.true_distance = max(self.true_distance - self.closing_speed * dt, 0.0)
 
         # append histories
         self.times.append(self.elapsed)
