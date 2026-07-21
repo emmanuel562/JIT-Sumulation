@@ -262,6 +262,150 @@ def simulate_run(
     }
 
 
+@dataclass
+class SimulationSession:
+    """Maintain live simulation state across ticks for Streamlit UI.
+
+    Usage:
+      session = SimulationSession(dt=0.1)
+      session.reset(inputs, seed=42)
+      snapshot = session.step(inputs)
+    """
+
+    dt: float = DEFAULT_DT
+    seed: int = 42
+
+    # runtime fields
+    rng: np.random.Generator = field(init=False)
+    tracker: KalmanTracker = field(init=False)
+    state_machine: JITStateMachine = field(init=False)
+    elapsed: float = 0.0
+    true_distance: float = 0.0
+    brake_level: float = 0.0
+    ramp_rate: float = BRAKE_MAX / 1.0
+
+    # history for charts
+    times: list[float] = field(default_factory=list)
+    distances: list[float] = field(default_factory=list)
+    ttc_actuals: list[float] = field(default_factory=list)
+    ttc_mins: list[float] = field(default_factory=list)
+    states: list[JITState] = field(default_factory=list)
+    brake_engagement: list[float] = field(default_factory=list)
+
+    # current inputs snapshot (useful for repeatable behaviour)
+    speed_ms: float = 0.0
+    closing_speed: float = 0.0
+    friction_used: float = 0.0
+
+    def reset(self, inputs: dict[str, Any], seed: int | None = None) -> None:
+        if seed is None:
+            seed = self.seed
+        self.rng = np.random.default_rng(seed)
+
+        self.dt = float(self.dt)
+        self.speed_ms = kmh_to_ms(float(inputs.get("vehicle_speed_kmh", 0)))
+        initial_distance = float(inputs.get("initial_distance_m", 0))
+        self.closing_speed = float(inputs.get("obstacle_closing_speed_ms", 0))
+        friction_slider = float(inputs.get("road_friction", 0.5))
+        rain = bool(inputs.get("rain_detected", False))
+
+        self.friction_used = FrictionEstimator().estimate(imu_value=friction_slider, rain=rain)
+
+        # initialise stateful components
+        self.tracker = KalmanTracker(dt=self.dt)
+        self.tracker.reset(initial_distance)
+        self.state_machine = JITStateMachine()
+
+        # reset runtime values and histories
+        self.elapsed = 0.0
+        self.true_distance = float(initial_distance)
+        self.brake_level = 0.0
+        self.times.clear()
+        self.distances.clear()
+        self.ttc_actuals.clear()
+        self.ttc_mins.clear()
+        self.states.clear()
+        self.brake_engagement.clear()
+
+    def force_idle(self) -> None:
+        self.state_machine.force_idle()
+
+    def step(self, inputs: dict[str, Any], dt: float | None = None) -> dict[str, Any]:
+        """Advance a single timestep using the provided inputs and return a snapshot."""
+        if dt is None:
+            dt = self.dt
+        else:
+            dt = float(dt)
+
+        # read inputs that can change live
+        camera_confidence = float(inputs.get("camera_confidence", 0.0))
+        driver_override = bool(inputs.get("driver_override", False))
+        rain = bool(inputs.get("rain_detected", False))
+        friction_slider = float(inputs.get("road_friction", self.friction_used if self.friction_used else 0.5))
+        self.speed_ms = kmh_to_ms(float(inputs.get("vehicle_speed_kmh", self.speed_ms)))
+        self.closing_speed = float(inputs.get("obstacle_closing_speed_ms", self.closing_speed))
+
+        # recompute friction and ttc_min each tick (slider may change)
+        self.friction_used = FrictionEstimator().estimate(imu_value=friction_slider, rain=rain)
+        ttc_min = calculate_ttc_min(self.speed_ms, self.friction_used)
+
+        # sensor reading with noise
+        noisy_distance = self.true_distance + self.rng.normal(0.0, DISTANCE_NOISE_STD)
+        noisy_distance = max(noisy_distance, 0.0)
+        distance, _ = self.tracker.update(noisy_distance)
+
+        # advance true object position
+        if self.closing_speed > 0:
+            self.true_distance = max(self.true_distance - self.closing_speed * dt, 0.0)
+
+        ttc_actual = calculate_ttc_actual(distance, self.closing_speed)
+
+        # update state machine
+        current_state = self.state_machine.step(
+            dt=dt,
+            ttc_actual=ttc_actual,
+            ttc_min=ttc_min,
+            camera_confidence=camera_confidence,
+            driver_override=driver_override,
+        )
+        self.state_machine.record(self.elapsed)
+
+        # brake engagement ramp
+        if should_engage_brake(current_state, ttc_actual, ttc_min):
+            self.brake_level = min(self.brake_level + self.ramp_rate * dt, BRAKE_MAX)
+        else:
+            self.brake_level = max(self.brake_level - self.ramp_rate * dt, 0.0)
+
+        # append histories
+        self.times.append(self.elapsed)
+        self.distances.append(distance)
+        self.ttc_actuals.append(ttc_actual)
+        self.ttc_mins.append(ttc_min)
+        self.states.append(current_state)
+        self.brake_engagement.append(self.brake_level)
+
+        snapshot = {
+            "time": self.elapsed,
+            "distance": distance,
+            "ttc_actual": ttc_actual,
+            "ttc_min": ttc_min,
+            "state": current_state,
+            "brake_level": self.brake_level,
+            "times": list(self.times),
+            "distances": list(self.distances),
+            "ttc_actuals": list(self.ttc_actuals),
+            "ttc_mins": list(self.ttc_mins),
+            "states": list(self.states),
+            "brake_engagement": list(self.brake_engagement),
+            "friction_used": self.friction_used,
+        }
+
+        # advance time
+        self.elapsed += dt
+
+        return snapshot
+
+
 def _default_test_inputs() -> dict[str, Any]:
     return {
         "vehicle_speed_kmh": 80,
