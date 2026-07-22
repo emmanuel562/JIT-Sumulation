@@ -46,10 +46,11 @@ Repository structure
 Team
 Team Axora
 
-Emmanuel — Project Lead
-Abdulbasit — Technical Co-Lead
-Dorcas - Intelligence and computing lead
-Maryam - Research and Business Strategy 
+- `Emmanuel` — Project Lead
+
+- `Abdulbasit` — Technical Co-Lead
+- `Dorcas` - Intelligence and computing lead
+- `Maryam` - Research and Business Strategy 
 
 Licence
 (To be decided)
